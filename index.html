@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Hand Draw — pinch to draw (single file)</title>
+  <style>
+    :root{--panel-bg:rgba(0,0,0,0.6);--accent:#ff5a5f}
+    html,body{height:100%;margin:0;font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;background:#000;color:#e6eef8}
+    .wrap{display:flex;flex-direction:column;align-items:center;gap:12px;padding:18px}
+    header{font-weight:700;font-size:20px}
+    .stage{position:relative;width:86vw;max-width:1000px;border-radius:12px;overflow:hidden;background:#000}
+
+    canvas{display:block;width:100%;height:auto}
+    #drawCanvas{position:relative;z-index:1}
+    #overlayCanvas{position:absolute;top:0;left:0;z-index:2;pointer-events:none}
+
+    .controls{display:flex;flex-wrap:wrap;gap:8px;align-items:center;justify-content:center;padding:10px;background:var(--panel-bg);border-radius:10px}
+    .controls label{display:flex;gap:6px;align-items:center;font-size:13px}
+    .controls input[type=color]{width:40px;height:30px;padding:0;border:0;background:none}
+    .controls button{background:transparent;border:1px solid rgba(255,255,255,0.08);padding:6px 10px;border-radius:8px;color:#e6eef8;cursor:pointer}
+    #status{font-size:13px;color:#9fb3d8;margin-top:6px}
+    footer{font-size:12px;color:#9fb3d8;opacity:0.9}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>Hand Draw — pinch to draw (single file)</header>
+
+    <div class="stage" id="stage">
+      <!-- hidden video used only as MediaPipe input -->
+      <video id="video" autoplay playsinline muted style="display:none"></video>
+
+      <!-- persistent drawing canvas -->
+      <canvas id="drawCanvas"></canvas>
+      <!-- overlay canvas for landmarks / cursor (cleared each frame) -->
+      <canvas id="overlayCanvas"></canvas>
+    </div>
+
+    <div class="controls">
+      <button id="startCamBtn">Start Camera</button>
+      <button id="stopCamBtn" disabled>Stop Camera</button>
+      <button id="localDrawBtn">Local Draw: Off</button>
+      <label>Color <input id="colorPicker" type="color" value="#ff3b30"></label>
+      <label>Size <input id="sizeRange" type="range" min="1" max="80" value="8"></label>
+      <button id="clearBtn">Clear</button>
+      <label style="font-size:13px"><input id="showLandmarks" type="checkbox" checked> Show landmarks</label>
+    </div>
+
+    <div id="status">Idle — click Start Camera or Local Draw.</div>
+    <footer>Tip: Serve over <code>http://localhost</code> or <code>https</code>. Allow camera when asked.</footer>
+  </div>
+
+  <!-- MediaPipe libs (CDN) -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js"></script>
+
+  <script>
+  // ---- UI ----
+  const video = document.getElementById('video');
+  const drawCanvas = document.getElementById('drawCanvas');
+  const overlayCanvas = document.getElementById('overlayCanvas');
+  const drawCtx = drawCanvas.getContext('2d');
+  const overlayCtx = overlayCanvas.getContext('2d');
+
+  const startCamBtn = document.getElementById('startCamBtn');
+  const stopCamBtn = document.getElementById('stopCamBtn');
+  const localDrawBtn = document.getElementById('localDrawBtn');
+  const colorPicker = document.getElementById('colorPicker');
+  const sizeRange = document.getElementById('sizeRange');
+  const clearBtn = document.getElementById('clearBtn');
+  const showLandmarks = document.getElementById('showLandmarks');
+  const status = document.getElementById('status');
+
+  // ---- state ----
+  let localDraw = false;
+  let cameraInstance = null;
+  let isDrawing = false;      // whether we are currently drawing (pinch active)
+  let wasPinching = false;
+  let lastX = null, lastY = null; // CSS pixel coords for smoothing
+
+  const CSS_W = 800; // initial CSS size — responsive CSS will scale, but logic uses CSS pixels
+  const CSS_H = 600;
+
+  function resizeCanvases(cssW = CSS_W, cssH = CSS_H){
+    const dpr = window.devicePixelRatio || 1;
+    // set high-res backing store for crisp lines
+    drawCanvas.width = Math.round(cssW * dpr);
+    drawCanvas.height = Math.round(cssH * dpr);
+    overlayCanvas.width = Math.round(cssW * dpr);
+    overlayCanvas.height = Math.round(cssH * dpr);
+
+    drawCanvas.style.width = overlayCanvas.style.width = cssW + 'px';
+    drawCanvas.style.height = overlayCanvas.style.height = cssH + 'px';
+
+    // drawCtx: we want to draw using CSS pixels, so set transform to map CSS->device
+    drawCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    // overlayCtx: leave identity transform (drawing_utils expects real canvas pixels)
+    overlayCtx.setTransform(1,0,0,1,0,0);
+
+    // initialize persistent black background on draw canvas (in CSS pixels)
+    drawCtx.fillStyle = 'black';
+    drawCtx.fillRect(0,0,cssW,cssH);
+  }
+  resizeCanvases();
+
+  // helpers
+  function cssSize(){
+    return {w: parseFloat(drawCanvas.style.width || CSS_W), h: parseFloat(drawCanvas.style.height || CSS_H)};
+  }
+
+  // mirror landmarks horizontally (returns new array of simple objects)
+  function mirrorLandmarks(landmarks){
+    return landmarks.map(l => ({x: 1 - l.x, y: l.y, z: l.z ?? 0}));
+  }
+
+  // ---- drawing logic (pinch to draw) ----
+  const PINCH_THRESHOLD_NORM = 0.05; // fraction of min(width,height)
+
+  function handleLandmarks(landmarks){
+    const css = cssSize();
+    const w = css.w, h = css.h;
+
+    // mirrored coords
+    const m = mirrorLandmarks(landmarks);
+
+    // index (8) and thumb (4) normalized
+    const ix = m[8].x, iy = m[8].y;
+    const tx = m[4].x, ty = m[4].y;
+
+    // convert to CSS pixels
+    const cx = ix * w;
+    const cy = iy * h;
+    const tx_px = tx * w;
+    const ty_px = ty * h;
+
+    // smoothing
+    const smoothX = (lastX === null) ? cx : (lastX * 0.65 + cx * 0.35);
+    const smoothY = (lastY === null) ? cy : (lastY * 0.65 + cy * 0.35);
+
+    // pinch distance in pixels, compare to threshold (pixel)
+    const distPx = Math.hypot((ix - tx) * w, (iy - ty) * h);
+    const pinchThreshPx = Math.min(w, h) * PINCH_THRESHOLD_NORM;
+    const pinching = distPx < pinchThreshPx;
+
+    // cursor on overlay (in device pixels)
+    if(showLandmarks.checked){
+      const dpr = window.devicePixelRatio || 1;
+      overlayCtx.beginPath();
+      overlayCtx.arc(ix * overlayCanvas.width, iy * overlayCanvas.height, Math.max(4, parseInt(sizeRange.value)/2) * dpr, 0, Math.PI*2);
+      overlayCtx.fillStyle = 'rgba(255,255,255,0.9)';
+      overlayCtx.fill();
+      overlayCtx.closePath();
+    }
+
+    // handle drawing into persistent drawCtx (CSS coords because drawCtx is scaled)
+    if(pinching){
+      if(!wasPinching){
+        // start stroke
+        isDrawing = true;
+        drawCtx.beginPath();
+        drawCtx.moveTo(smoothX, smoothY);
+      }
+      if(isDrawing){
+        drawCtx.strokeStyle = colorPicker.value;
+        drawCtx.lineWidth = parseInt(sizeRange.value, 10);
+        drawCtx.lineCap = 'round';
+        drawCtx.lineJoin = 'round';
+
+        drawCtx.lineTo(smoothX, smoothY);
+        drawCtx.stroke();
+      }
+    } else {
+      // stop drawing
+      if(isDrawing){
+        drawCtx.closePath();
+      }
+      isDrawing = false;
+    }
+
+    lastX = smoothX; lastY = smoothY;
+    wasPinching = pinching;
+  }
+
+  // ---- MediaPipe Hands ----
+  const hands = new Hands({locateFile: file => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+  hands.setOptions({
+    maxNumHands: 2,
+    modelComplexity: 1,
+    minDetectionConfidence: 0.7,
+    minTrackingConfidence: 0.6
+  });
+
+  hands.onResults(results => {
+    // clear overlay each frame
+    overlayCtx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+    if(results.multiHandLandmarks && results.multiHandLandmarks.length > 0){
+      // draw landmarks & connectors mirrored on the overlay
+      for(const lm of results.multiHandLandmarks){
+        const mirrored = mirrorLandmarks(lm);
+        if(showLandmarks.checked && typeof drawConnectors === 'function'){
+          drawConnectors(overlayCtx, mirrored, HAND_CONNECTIONS, {color:'#00ffb3', lineWidth:2});
+          drawLandmarks(overlayCtx, mirrored, {color:'#ffa500', lineWidth:2});
+        }
+      }
+
+      // use first hand for pinch-to-draw
+      handleLandmarks(results.multiHandLandmarks[0]);
+      status.textContent = 'Hand detected — ' + (wasPinching ? 'Drawing' : 'Hover');
+    } else {
+      status.textContent = 'No hand detected — show your hand to the camera';
+      wasPinching = false;
+      lastX = lastY = null;
+    }
+  });
+
+  // ---- Camera control ----
+  startCamBtn.addEventListener('click', async () => {
+    try{
+      // user gesture to request camera
+      cameraInstance = new Camera(video, {
+        onFrame: async () => { await hands.send({image: video}); },
+        width: 1280,
+        height: 720
+      });
+      await cameraInstance.start();
+      startCamBtn.disabled = true; stopCamBtn.disabled = false;
+      status.textContent = 'Camera started — show your hand and pinch to draw.';
+    }catch(err){
+      console.error('Camera start failed', err);
+      status.textContent = err && err.name === 'NotAllowedError' ? 'Permission denied — enable camera in browser or use Local Draw.' : 'Failed to start camera: ' + (err && err.message ? err.message : err);
+    }
+  });
+
+  stopCamBtn.addEventListener('click', () => {
+    if(cameraInstance) cameraInstance.stop();
+    startCamBtn.disabled = false; stopCamBtn.disabled = true;
+    status.textContent = 'Camera stopped.';
+  });
+
+  // ---- Local draw (pointer) ----
+  localDrawBtn.addEventListener('click', () => {
+    localDraw = !localDraw;
+    localDrawBtn.textContent = 'Local Draw: ' + (localDraw ? 'On' : 'Off');
+    status.textContent = localDraw ? 'Local draw enabled — use mouse/touch.' : 'Local draw disabled.';
+  });
+
+  // pointer events on drawCanvas (use CSS coords — drawCtx is scaled to CSS)
+  drawCanvas.addEventListener('pointerdown', (e) => {
+    if(localDraw){
+      const rect = drawCanvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      lastX = x; lastY = y; isDrawing = true; // mark drawing for local
+    }
+  });
+  window.addEventListener('pointermove', (e) => {
+    if(localDraw && isDrawing){
+      const rect = drawCanvas.getBoundingClientRect();
+      const x = e.clientX - rect.left;
+      const y = e.clientY - rect.top;
+      drawCtx.strokeStyle = colorPicker.value;
+      drawCtx.lineWidth = parseInt(sizeRange.value,10);
+      drawCtx.lineCap = 'round';
+      drawCtx.beginPath();
+      drawCtx.moveTo(lastX, lastY);
+      drawCtx.lineTo(x, y);
+      drawCtx.stroke();
+      lastX = x; lastY = y;
+    }
+  });
+  window.addEventListener('pointerup', () => { if(localDraw) isDrawing = false; });
+
+  clearBtn.addEventListener('click', ()=>{
+    const css = cssSize();
+    drawCtx.clearRect(0,0,css.w,css.h);
+    drawCtx.fillStyle = 'black';
+    drawCtx.fillRect(0,0,css.w,css.h);
+  });
+
+  // keep canvas sizes responsive when the window resizes
+  window.addEventListener('resize', ()=> resizeCanvases(parseInt(getComputedStyle(drawCanvas).width), parseInt(getComputedStyle(drawCanvas).height)));
+
+  </script>
+</body>
+</html>
